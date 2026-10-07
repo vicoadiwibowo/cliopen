@@ -112,7 +112,7 @@ pm_update || die "Router harus online. Cek koneksi internet & DNS."
 STEP="install paket sistem"
 say "Memasang paket (python3, ffmpeg, dll) — bisa beberapa menit..."
 FAILED=""
-for p in ca-bundle ca-certificates curl python3 python3-pip python3-flask python3-requests ffmpeg; do
+for p in ca-bundle ca-certificates python3 python3-pip python3-flask python3-requests ffmpeg; do
     pm_install "$p" >/dev/null 2>&1 || {
         # coba sekali lagi dengan output kelihatan supaya penyebab jelas
         pm_install "$p" 2>&1 | tail -n 3
@@ -121,12 +121,14 @@ for p in ca-bundle ca-certificates curl python3 python3-pip python3-flask python
 done
 [ -n "$FAILED" ] && warn "Paket gagal dipasang lewat $PM:$FAILED (akan dicek / dicari alternatif di bawah)"
 
-fetch() {  # fetch URL OUTPUT
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --retry 3 --connect-timeout 20 -o "$2" "$1"
-    else
-        wget -q -O "$2" "$1"
+curl_ok() { command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; }
+
+fetch() {  # fetch URL OUTPUT  (curl kalau sehat, kalau tidak: wget)
+    if curl_ok && curl -fsSL --retry 3 --connect-timeout 20 -o "$2" "$1" 2>/dev/null; then
+        return 0
     fi
+    rm -f "$2"
+    wget -q -O "$2" "$1" && [ -s "$2" ]
 }
 
 # ---------- Python & library ----------
@@ -1944,7 +1946,7 @@ LAN_IP="$(uci -q get network.lan.ipaddr 2>/dev/null | cut -d/ -f1)"
 
 UP=0
 for i in 1 2 3 4 5; do
-    if curl -s -o /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null; then UP=1; break; fi
+    if wget -q -O /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null; then UP=1; break; fi
     sleep 3
 done
 
