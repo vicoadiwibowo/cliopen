@@ -1,234 +1,124 @@
 #!/bin/sh
-# ==============================================================================
-#  AI VIDEO KLIP V4 — install.sh untuk OpenWrt  (SATU FILE, SEMUA ISI)
-#
-#  Satu file ini sudah memuat: app.py, templates/index.html, script start,
-#  service procd (auto-start saat boot), dan pembuat folder di /mnt/sda1.
-#
-#  Cara pakai (di router, lewat SSH, sebagai root):
-#    wget -O /tmp/install.sh https://raw.githubusercontent.com/USERNAME/REPO/main/install.sh
-#    sh /tmp/install.sh
-#
-#  Opsi (environment variable, opsional):
-#    GEMINI_API_KEY=xxxx   langsung isi API key tanpa prompt
-#    AIVK_DIR=/mnt/sda1/ai-video-klip   lokasi instalasi + data
-#    AIVK_MOUNT=/mnt/sda1               mount point yang wajib aktif
-#    AIVK_PORT=5000                     port web
-#
-#  Perintah lain:
-#    sh install.sh uninstall    hapus service (data video/klip TIDAK dihapus)
-#    Jalankan ulang install.sh  = update aplikasi (.env, video, klip tetap aman)
-# ==============================================================================
+# ============================================================
+#  AI VIDEO KLIP V4 — install.sh (OpenWrt)
+#  Satu file ini sudah berisi app.py dan templates/index.html,
+#  jadi cukup install.sh saja. Semua data (video, klip, subtitle,
+#  musik, .env, state) ada di /mnt/sda1/ai-video-klip.
+#  Pakai POSIX sh (ash/busybox), bukan bash.
+#  Pemakaian: sh install.sh
+# ============================================================
+set -eu
 
-INSTALL_DIR="${AIVK_DIR:-/mnt/sda1/ai-video-klip}"
-MOUNT_POINT="${AIVK_MOUNT:-/mnt/sda1}"
-PORT="${AIVK_PORT:-5000}"
-SERVICE="ai-video-klip"
-STEP=""
+STORAGE_MOUNT="/mnt/sda1"
+PROJECT_DIR="$STORAGE_MOUNT/ai-video-klip"
+SERVICE_NAME="ai-video-klip"
+APP_PORT="5000"
+STEP="mulai instalasi"
+PKG_MGR=""
 
-say()  { echo "▶ $*"; }
-warn() { echo "⚠️  $*"; }
-die() {
-    echo ""
-    echo "❌ GAGAL pada tahap: $STEP"
-    [ -n "${1:-}" ] && echo "   $1"
-    echo "   Perbaiki penyebabnya lalu jalankan ulang: sh install.sh"
+log() { printf '%s\n' "$*"; }
+trap 'rc=$?; if [ "$rc" -ne 0 ]; then printf "\n❌ GAGAL pada tahap: %s\n   Perbaiki penyebabnya lalu jalankan ulang: sh install.sh\n" "$STEP"; fi' EXIT
+
+log "🎬 AI Video Klip V4 — Installer OpenWrt"
+log "======================================="
+
+STEP="cek hak akses root"
+[ "$(id -u)" = "0" ] || { log "Jalankan sebagai root."; exit 1; }
+
+STEP="cek storage $STORAGE_MOUNT"
+if ! grep -q " $STORAGE_MOUNT " /proc/mounts; then
+    log "❌ $STORAGE_MOUNT belum ter-mount."
+    log "   Pasang USB lalu mount (LuCI > System > Mount Points), baru jalankan ulang."
     exit 1
-}
-
-echo "🎬 AI Video Klip V4 — Installer OpenWrt"
-echo "========================================"
-
-# ---------- uninstall ----------
-if [ "${1:-}" = "uninstall" ]; then
-    [ -x "/etc/init.d/$SERVICE" ] && { "/etc/init.d/$SERVICE" stop; "/etc/init.d/$SERVICE" disable; }
-    rm -f "/etc/init.d/$SERVICE"
-    echo "✓ Service dihapus."
-    echo "  Kode & data masih ada di: $INSTALL_DIR"
-    echo "  Kalau mau hapus total: rm -rf $INSTALL_DIR"
-    exit 0
+fi
+FREE_KB="$(df -k "$STORAGE_MOUNT" | awk 'NR==2 {print $4}')"
+if [ "${FREE_KB:-0}" -lt 1048576 ]; then
+    log "⚠️  Sisa ruang di $STORAGE_MOUNT kurang dari 1 GB ($((FREE_KB / 1024)) MB)."
 fi
 
-# ---------- cek dasar ----------
-STEP="cek root"
-[ "$(id -u)" = "0" ] || die "Jalankan sebagai root."
-[ -f /etc/openwrt_release ] || warn "Ini sepertinya bukan OpenWrt — lanjut, tapi tidak dijamin jalan."
+STEP="siapkan folder di $PROJECT_DIR"
+mkdir -p "$PROJECT_DIR/downloads" "$PROJECT_DIR/clips" \
+         "$PROJECT_DIR/uploads_srt" "$PROJECT_DIR/uploads_music" \
+         "$PROJECT_DIR/templates" "$PROJECT_DIR/.tmp" "$PROJECT_DIR/.cache/pip"
+log "✓ Folder project: $PROJECT_DIR"
 
 STEP="deteksi package manager"
-if command -v opkg >/dev/null 2>&1; then
-    PM=opkg
-elif command -v apk >/dev/null 2>&1; then
-    PM=apk
+if command -v apk >/dev/null 2>&1; then
+    PKG_MGR="apk"
+elif command -v opkg >/dev/null 2>&1; then
+    PKG_MGR="opkg"
 else
-    die "opkg / apk tidak ditemukan."
+    log "❌ opkg/apk tidak ditemukan. Pastikan ini OpenWrt."
+    exit 1
 fi
-say "Package manager: $PM"
+log "📦 Package manager: $PKG_MGR"
 
-pm_update()  { if [ "$PM" = opkg ]; then opkg update; else apk update; fi; }
-pm_install() { if [ "$PM" = opkg ]; then opkg install "$@"; else apk add "$@"; fi; }
+# /tmp itu RAM (kecil) — pindahkan temp & cache install ke USB
+export TMPDIR="$PROJECT_DIR/.tmp"
+export PIP_CACHE_DIR="$PROJECT_DIR/.cache/pip"
 
-# ---------- cek storage /mnt/sda1 ----------
-STEP="cek storage $MOUNT_POINT"
-is_mounted() { grep -q " $MOUNT_POINT " /proc/mounts 2>/dev/null; }
-if ! is_mounted; then
-    command -v block >/dev/null 2>&1 && block mount >/dev/null 2>&1
-    sleep 2
-fi
-if ! is_mounted; then
-    if [ "${AIVK_ALLOW_UNMOUNTED:-0}" != "1" ]; then
-        echo "   $MOUNT_POINT belum ter-mount. Kalau dibiarkan, video akan menumpuk di flash router."
-        echo "   Cek: ls /dev/sd*   dan   block info"
-        echo "   Biasanya perlu paket: kmod-usb-storage block-mount + kmod-fs-ext4 (atau kmod-fs-exfat / kmod-fs-ntfs3)"
-        echo "   lalu atur di LuCI: System > Mount Points (mount ke $MOUNT_POINT), kemudian: block mount"
-        die "Storage belum siap."
-    fi
-    warn "Storage belum ter-mount, dilanjutkan karena AIVK_ALLOW_UNMOUNTED=1"
-fi
-mkdir -p "$INSTALL_DIR" 2>/dev/null || die "Tidak bisa membuat $INSTALL_DIR"
-touch "$INSTALL_DIR/.write_test" 2>/dev/null || die "$INSTALL_DIR tidak bisa ditulis (read-only?)"
-rm -f "$INSTALL_DIR/.write_test"
-say "Storage OK: $(df -h "$MOUNT_POINT" 2>/dev/null | awk 'NR==2{print $4" kosong dari "$2}')"
-
-# ---------- buat folder ----------
-STEP="membuat folder"
-for d in downloads clips uploads_srt uploads_music templates fonts bin pylibs tmp cache; do
-    mkdir -p "$INSTALL_DIR/$d" || die "Gagal membuat $INSTALL_DIR/$d"
-done
-say "Folder dibuat di $INSTALL_DIR  (downloads, clips, uploads_srt, uploads_music, ...)"
-
-# Semua file sementara (pip, unduhan) ke storage, bukan ke RAM /tmp
-export TMPDIR="$INSTALL_DIR/tmp"
-export PATH="$INSTALL_DIR/bin:$PATH"
-export PYTHONPATH="$INSTALL_DIR/pylibs${PYTHONPATH:+:$PYTHONPATH}"
-
-OVL_FREE="$(df -k /overlay 2>/dev/null | awk 'NR==2{print $4}')"
-[ -n "$OVL_FREE" ] && [ "$OVL_FREE" -lt 40000 ] 2>/dev/null && \
-    warn "Flash/overlay tinggal $((OVL_FREE/1024)) MB. Python + ffmpeg butuh lumayan besar; kalau gagal, pakai extroot."
-
-# ---------- paket sistem ----------
-STEP="update daftar paket ($PM update)"
-pm_update || die "Router harus online. Cek koneksi internet & DNS."
-
-STEP="install paket sistem"
-say "Memasang paket (python3, ffmpeg, dll) — bisa beberapa menit..."
-FAILED=""
-for p in ca-bundle ca-certificates python3 python3-pip python3-flask python3-requests ffmpeg; do
-    pm_install "$p" >/dev/null 2>&1 || {
-        # coba sekali lagi dengan output kelihatan supaya penyebab jelas
-        pm_install "$p" 2>&1 | tail -n 3
-        pm_install "$p" >/dev/null 2>&1 || FAILED="$FAILED $p"
-    }
-done
-[ -n "$FAILED" ] && warn "Paket gagal dipasang lewat $PM:$FAILED (akan dicek / dicari alternatif di bawah)"
-
-curl_ok() { command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; }
-
-fetch() {  # fetch URL OUTPUT  (curl kalau sehat, kalau tidak: wget)
-    if curl_ok && curl -fsSL --retry 3 --connect-timeout 20 -o "$2" "$1" 2>/dev/null; then
-        return 0
-    fi
-    rm -f "$2"
-    wget -q -O "$2" "$1" && [ -s "$2" ]
-}
-
-# ---------- Python & library ----------
-STEP="cek python3"
-command -v python3 >/dev/null 2>&1 || die "python3 tidak terpasang (kemungkinan flash penuh)."
-
-STEP="cek modul ssl python"
-if ! python3 -c "import ssl" 2>/dev/null; then
-    pm_install python3-openssl >/dev/null 2>&1
-    python3 -c "import ssl" 2>/dev/null || die "Modul ssl Python tidak tersedia."
+STEP="update daftar paket"
+if [ "$PKG_MGR" = "apk" ]; then
+    apk update >/dev/null 2>&1 || true
+else
+    opkg update
 fi
 
-STEP="install Flask & requests"
-if ! python3 -c "import flask, requests" 2>/dev/null; then
-    say "Flask/requests belum ada lewat $PM, pasang lewat pip ke $INSTALL_DIR/pylibs"
-    python3 -m pip install --no-cache-dir --target "$INSTALL_DIR/pylibs" flask requests \
-        || die "pip gagal memasang Flask/requests."
-fi
-python3 -c "import flask, requests" 2>/dev/null || die "Flask/requests masih tidak bisa di-import."
-
-STEP="install yt-dlp"
-say "Memasang yt-dlp (ke $INSTALL_DIR/pylibs)..."
-python3 -m pip install --no-cache-dir --upgrade --target "$INSTALL_DIR/pylibs" yt-dlp \
-    || die "pip gagal memasang yt-dlp (python3-pip terpasang? internet jalan?)."
-
-cat > "$INSTALL_DIR/bin/yt-dlp" <<'AIVK_EOF_YTDLP'
-#!/bin/sh
-D="$(cd "$(dirname "$0")/.." && pwd)"
-PYTHONPATH="$D/pylibs${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m yt_dlp "$@"
-AIVK_EOF_YTDLP
-chmod +x "$INSTALL_DIR/bin/yt-dlp" 2>/dev/null
-"$INSTALL_DIR/bin/yt-dlp" --version >/dev/null 2>&1 || die "yt-dlp terpasang tapi tidak bisa dijalankan."
-say "yt-dlp versi $("$INSTALL_DIR/bin/yt-dlp" --version 2>/dev/null)"
-
-# ---------- ffmpeg: pastikan fiturnya lengkap ----------
-STEP="cek fitur ffmpeg"
-ff_ok() {
-    command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1 || return 1
-    ENC="$(ffmpeg -hide_banner -encoders 2>/dev/null)"
-    FLT="$(ffmpeg -hide_banner -filters 2>/dev/null)"
-    echo "$ENC" | grep -q "libx264" || return 1
-    echo "$ENC" | grep -qE " aac " || return 1
-    for f in subtitles eq fade silencedetect aselect amix crop select; do
-        echo "$FLT" | grep -qE " $f " || return 1
+pkg_add() {
+    for p in "$@"; do
+        if [ "$PKG_MGR" = "apk" ]; then
+            if apk add -q "$p" >/dev/null 2>&1; then log "   ✓ $p"; else log "   · $p tidak tersedia (skip)"; fi
+        else
+            if opkg install "$p" >/dev/null 2>&1; then log "   ✓ $p"; else log "   · $p tidak tersedia (skip)"; fi
+        fi
     done
-    return 0
 }
 
-if ff_ok; then
-    say "ffmpeg dari $PM sudah lengkap (libx264, aac, subtitles/libass, dst)."
+STEP="pasang paket sistem (python, ffmpeg, yt-dlp, font)"
+log "📥 Memasang paket..."
+if [ "$PKG_MGR" = "apk" ]; then
+    pkg_add python3 py3-pip py3-flask py3-requests ffmpeg yt-dlp ttf-dejavu fontconfig
 else
-    warn "ffmpeg dari $PM kurang fitur (butuh libx264 + filter subtitles/libass). Pakai build static."
-    case "$(uname -m)" in
-        x86_64)          FFARCH="amd64" ;;
-        aarch64|arm64)   FFARCH="arm64" ;;
-        armv7*|armhf)    FFARCH="armhf" ;;
-        armv6*|arm)      FFARCH="armel" ;;
-        i?86)            FFARCH="i686" ;;
-        *)               FFARCH="" ;;
-    esac
-    [ -n "$FFARCH" ] || die "Arsitektur $(uname -m) tidak punya build ffmpeg static otomatis. Pasang 'ffmpeg-full' / build sendiri."
-    pm_install xz xz-utils tar >/dev/null 2>&1
-    command -v xz >/dev/null 2>&1 || die "Perintah xz tidak ada (pasang paket xz / xz-utils)."
-    STEP="unduh ffmpeg static ($FFARCH)"
-    FFTMP="$INSTALL_DIR/tmp/ffmpeg-static"
-    rm -rf "$FFTMP"; mkdir -p "$FFTMP"
-    fetch "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-$FFARCH-static.tar.xz" "$FFTMP/ff.tar.xz" \
-        || die "Gagal mengunduh ffmpeg static."
-    xz -dc "$FFTMP/ff.tar.xz" | tar -xf - -C "$FFTMP" || die "Gagal ekstrak ffmpeg static."
-    FFBIN="$(find "$FFTMP" -type f -name ffmpeg  | head -n 1)"
-    FPBIN="$(find "$FFTMP" -type f -name ffprobe | head -n 1)"
-    [ -n "$FFBIN" ] && [ -n "$FPBIN" ] || die "ffmpeg/ffprobe tidak ditemukan di arsip."
-    cp "$FFBIN" "$INSTALL_DIR/bin/ffmpeg" && cp "$FPBIN" "$INSTALL_DIR/bin/ffprobe" || die "Gagal menyalin ffmpeg."
-    chmod +x "$INSTALL_DIR/bin/ffmpeg" "$INSTALL_DIR/bin/ffprobe" 2>/dev/null
-    rm -rf "$FFTMP"
-    hash -r 2>/dev/null
-    STEP="verifikasi ffmpeg static"
-    ff_ok || die "ffmpeg static terpasang tapi tidak lolos pengecekan fitur."
-    say "ffmpeg static terpasang di $INSTALL_DIR/bin"
+    pkg_add python3 python3-pip python3-flask python3-requests ffmpeg ffprobe yt-dlp ttf-dejavu fontconfig
 fi
 
-# ---------- font subtitle ----------
-STEP="unduh font subtitle"
-FONT_BASE="https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/version_2_37/ttf"
-FONT_OK=0
-for f in DejaVuSans-Bold.ttf DejaVuSans.ttf; do
-    if [ ! -s "$INSTALL_DIR/fonts/$f" ]; then
-        fetch "$FONT_BASE/$f" "$INSTALL_DIR/fonts/$f" 2>/dev/null || rm -f "$INSTALL_DIR/fonts/$f"
+STEP="pasang pustaka Python (flask, requests, yt-dlp)"
+if ! python3 -c "import flask, requests" >/dev/null 2>&1; then
+    log "🐍 Memasang flask & requests lewat pip..."
+    python3 -m pip install -q flask requests \
+        || python3 -m pip install -q --break-system-packages flask requests
+fi
+if python3 -m pip --version >/dev/null 2>&1; then
+    # yt-dlp dari pip biasanya lebih update (YouTube sering berubah)
+    python3 -m pip install -q -U yt-dlp >/dev/null 2>&1 \
+        || python3 -m pip install -q --break-system-packages -U yt-dlp >/dev/null 2>&1 \
+        || log "   ⚠️  Update yt-dlp lewat pip gagal, pakai versi dari paket."
+fi
+
+STEP="cek binary python3 / ffmpeg / ffprobe / yt-dlp"
+for b in python3 ffmpeg ffprobe yt-dlp; do
+    if ! command -v "$b" >/dev/null 2>&1; then
+        log "❌ '$b' belum ketemu di PATH."
+        exit 1
     fi
-    [ -s "$INSTALL_DIR/fonts/$f" ] && FONT_OK=1
 done
-if [ "$FONT_OK" = "1" ]; then
-    say "Font subtitle: DejaVu Sans"
-else
-    warn "Font gagal diunduh. Taruh file .ttf apa saja di $INSTALL_DIR/fonts/ lalu isi AIVK_FONT_NAME=<nama font> di .env, kalau tidak subtitle bisa gagal."
+if ! python3 -c "import flask, requests" >/dev/null 2>&1; then
+    log "❌ Modul flask/requests belum bisa di-import."
+    exit 1
+fi
+log "✓ python3, ffmpeg, ffprobe, yt-dlp, flask, requests siap."
+
+STEP="cek kemampuan ffmpeg"
+if ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libx264; then
+    log "⚠️  ffmpeg ini TANPA libx264 — klip tidak bisa di-encode."
+    log "   Build ffmpeg di router perlu libx264 (ganti paket ffmpeg dengan build yang lengkap)."
+fi
+if ! ffmpeg -hide_banner -filters 2>/dev/null | grep -q subtitles; then
+    log "⚠️  ffmpeg ini TANPA filter 'subtitles' (butuh libass) — subtitle burn-in tidak jalan."
 fi
 
-# ---------- tulis file aplikasi ----------
-STEP="menulis app.py"
-cat > "$INSTALL_DIR/app.py" <<'AIVK_EOF_APP'
+STEP="tulis app.py"
+cat > "$PROJECT_DIR/app.py" <<'KLIP_APP_EOF'
 # ============================================================
 #  AI VIDEO KLIP V4 — app.py
 #  Perubahan dari v3: model Gemini auto-fallback (2.5-flash akan
@@ -249,8 +139,6 @@ import requests as http_requests
 from flask import Flask, render_template, request, jsonify, send_from_directory, send_file, url_for
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# OpenWrt: semua data (video, klip, srt, musik, state) disimpan di storage USB/HDD
-DATA_DIR = os.environ.get('AIVK_DATA_DIR') or '/mnt/sda1/ai-video-klip'
 
 def load_dotenv(path):
     """Parser .env sederhana (tanpa dependency tambahan)."""
@@ -280,7 +168,7 @@ def env_or(key, default):
 #  cuma fallback kalau .env / env var tidak ada.
 # ============================================================
 CONFIG = {
-    'GEMINI_API_KEY': env_or('GEMINI_API_KEY', ''),
+    'GEMINI_API_KEY': env_or('GEMINI_API_KEY', 'ISI_GEMINI_API_KEY_DISINI'),
     # Model utama dicoba dulu, kalau Google mematikan/mengganti nama modelnya
     # (404 NOT_FOUND), otomatis lanjut ke kandidat berikutnya — jadi app tidak
     # rusak total saat Google pensiunkan satu model generasi.
@@ -299,7 +187,7 @@ CONFIG = {
     'AUDIO_BITRATE':  '192k',
     'BGM_VOLUME':     0.5,
     'FFMPEG_TIMEOUT': 900,
-    'SUB_FONT':      env_or('AIVK_FONT_NAME', 'DejaVu Sans'),
+    'SUB_FONT':      'DejaVu Sans',
     'SUB_FONT_RATIO': 0.042,
     'SUB_MARGIN_RATIO': 0.085,
     'SUB_MARGIN_LR_RATIO': 0.06,
@@ -311,11 +199,11 @@ CONFIG = {
     'YT_DOWNLOAD_THREADS': '16',
 }
 
-DOWNLOAD_DIR = os.path.join(DATA_DIR, 'downloads')
-CLIP_DIR     = os.path.join(DATA_DIR, 'clips')
-SRT_DIR      = os.path.join(DATA_DIR, 'uploads_srt')
-MUSIC_DIR    = os.path.join(DATA_DIR, 'uploads_music')
-STATE_FILE   = os.path.join(DATA_DIR, 'state.json')
+DOWNLOAD_DIR = os.path.join(BASE_DIR, 'downloads')
+CLIP_DIR     = os.path.join(BASE_DIR, 'clips')
+SRT_DIR      = os.path.join(BASE_DIR, 'uploads_srt')
+MUSIC_DIR    = os.path.join(BASE_DIR, 'uploads_music')
+STATE_FILE   = os.path.join(BASE_DIR, 'state.json')
 
 for d in (DOWNLOAD_DIR, CLIP_DIR, SRT_DIR, MUSIC_DIR):
     os.makedirs(d, exist_ok=True)
@@ -387,7 +275,7 @@ def check_dependencies():
     missing = [b for b in ('ffmpeg', 'ffprobe', 'yt-dlp') if not shutil.which(b)]
     if missing:
         print('⚠️  Binary belum terpasang: ' + ', '.join(missing))
-        print('    Jalankan ulang install.sh (OpenWrt), atau cek: opkg install ffmpeg && pip install yt-dlp')
+        print('    Jalankan ulang install.sh, atau: opkg install ffmpeg yt-dlp  (atau: python3 -m pip install -U yt-dlp)')
     else:
         print('✓ Dependency oke: ffmpeg, ffprobe, yt-dlp ditemukan di PATH')
     return missing
@@ -594,9 +482,6 @@ def build_ass(entries, cs, ce, out_path, sq):
         f.write(NL.join(p) + NL)
     return count
 
-FONTS_DIR = os.environ.get('AIVK_FONTS_DIR') or os.path.join(DATA_DIR, 'fonts')
-FONTS_OPT = (":fontsdir='" + FONTS_DIR.replace(':', '\\:') + "'") if os.path.isdir(FONTS_DIR) else ''
-
 def esc_ff(path):
     return path.replace('\\','\\\\').replace(':','\\:').replace("'","\\'")
 
@@ -739,7 +624,7 @@ def do_cut(job_id, video_path, clips_data, vid, srt_path=None, music_path=None):
                 vf_list.append('fade=t=in:st=0:d=0.4')
                 vf_list.append('fade=t=out:st=' + str(max(0.1, dur - 0.4)) + ':d=0.4')
             if ass_path:
-                vf_list.append("subtitles='" + esc_ff(ass_path) + "'" + FONTS_OPT)
+                vf_list.append("subtitles='" + esc_ff(ass_path) + "'")
             vf = ','.join(vf_list)
 
             afilter = None
@@ -1288,16 +1173,15 @@ def stream_video(filename):
 if __name__ == '__main__':
     load_state()
     check_dependencies()
-    PORT = int(os.environ.get('AIVK_PORT') or 5000)
-    print('🎬 AI Video Klip V4 (OpenWrt) — http://0.0.0.0:' + str(PORT))
-    print('📁 Data: ' + DATA_DIR)
+    print('🎬 AI Video Klip V4 — http://0.0.0.0:5000')
     if not GEMINI_API_KEY or GEMINI_API_KEY.startswith('ISI_'):
         print('⚠️  WARNING: GEMINI_API_KEY belum diisi. Isi lewat file .env (GEMINI_API_KEY=...) atau CONFIG di app.py!')
-    app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
-AIVK_EOF_APP
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+KLIP_APP_EOF
+log "✓ app.py ditulis"
 
-STEP="menulis templates/index.html"
-cat > "$INSTALL_DIR/templates/index.html" <<'AIVK_EOF_HTML'
+STEP="tulis templates/index.html"
+cat > "$PROJECT_DIR/templates/index.html" <<'KLIP_HTML_EOF'
 <!DOCTYPE html>
 <html lang="id">
 <head>
@@ -1839,134 +1723,81 @@ window.addEventListener('load',async()=>{await loadFiles();await checkActiveJob(
 </script>
 </body>
 </html>
-AIVK_EOF_HTML
+KLIP_HTML_EOF
+log "✓ templates/index.html ditulis"
 
-STEP="menulis start.sh"
-cat > "$INSTALL_DIR/start.sh" <<'AIVK_EOF_START'
-#!/bin/sh
-# Menjalankan AI Video Klip V4 (dipakai service procd, bisa juga manual: sh start.sh)
-cd "$(cd "$(dirname "$0")" && pwd)" || exit 1
-
-export PATH="$PWD/bin:$PATH"
-export PYTHONPATH="$PWD/pylibs${PYTHONPATH:+:$PYTHONPATH}"
-export AIVK_DATA_DIR="$PWD"
-export TMPDIR="$PWD/tmp"
-export HOME="$PWD"
-export XDG_CACHE_HOME="$PWD/cache"
-[ -d "$PWD/fonts" ] && export AIVK_FONTS_DIR="$PWD/fonts"
-mkdir -p "$TMPDIR" "$XDG_CACHE_HOME"
-
-for bin in ffmpeg ffprobe yt-dlp python3; do
-    if ! command -v "$bin" >/dev/null 2>&1; then
-        echo "❌ '$bin' belum terpasang. Jalankan ulang install.sh"
-        exit 1
-    fi
-done
-
-exec python3 app.py
-AIVK_EOF_START
-
-STEP="menulis update-ytdlp.sh"
-cat > "$INSTALL_DIR/update-ytdlp.sh" <<'AIVK_EOF_UPD'
-#!/bin/sh
-# Update yt-dlp (jalankan kalau download/subtitle YouTube mendadak gagal)
-D="$(cd "$(dirname "$0")" && pwd)"
-TMPDIR="$D/tmp" python3 -m pip install --no-cache-dir --upgrade --target "$D/pylibs" yt-dlp \
-  && "$D/bin/yt-dlp" --version
-AIVK_EOF_UPD
-chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/update-ytdlp.sh" 2>/dev/null
-
-# validasi sintaks python sebelum lanjut
-STEP="validasi app.py"
-python3 -m py_compile "$INSTALL_DIR/app.py" || die "app.py tidak valid."
-rm -rf "$INSTALL_DIR/__pycache__"
-
-# ---------- Gemini API key (.env) ----------
-STEP="setup .env"
-ENV_FILE="$INSTALL_DIR/.env"
-CURRENT_KEY=""
-[ -f "$ENV_FILE" ] && CURRENT_KEY="$(grep -m1 '^GEMINI_API_KEY=' "$ENV_FILE" | cut -d= -f2-)"
-case "$CURRENT_KEY" in ISI_*) CURRENT_KEY="" ;; esac
-
-NEW_KEY="${GEMINI_API_KEY:-}"
-echo ""
-echo "🔑 Gemini API Key (gratis di https://aistudio.google.com/apikey)"
-if [ -z "$NEW_KEY" ]; then
-    if [ -n "$CURRENT_KEY" ]; then
-        echo "   Sudah ada key tersimpan (diakhiri ...$(echo "$CURRENT_KEY" | awk '{print substr($0,length($0)-5)}'))."
-        printf "   Ganti dengan key baru? (kosongkan untuk tetap pakai yang lama): "
-    else
-        printf "   Masukkan GEMINI_API_KEY (boleh kosong, isi nanti di .env): "
-    fi
-    { read -r NEW_KEY < /dev/tty; } 2>/dev/null || { NEW_KEY=""; echo ""; }
+STEP="siapkan state.json"
+if [ ! -f "$PROJECT_DIR/state.json" ]; then
+    printf '{\n  "videos": {},\n  "clips": {}\n}\n' > "$PROJECT_DIR/state.json"
 fi
 
+STEP="setup GEMINI_API_KEY (.env)"
+ENV_FILE="$PROJECT_DIR/.env"
+CURRENT_KEY=""
+if [ -f "$ENV_FILE" ]; then
+    CURRENT_KEY="$(sed -n 's/^GEMINI_API_KEY=//p' "$ENV_FILE" | head -n 1)"
+fi
+NEW_KEY=""
+log ""
+log "🔑 Setup Gemini API Key (gratis: https://aistudio.google.com/apikey)"
+if [ -r /dev/tty ]; then
+    if [ -n "$CURRENT_KEY" ] && [ "${CURRENT_KEY#ISI_}" = "$CURRENT_KEY" ]; then
+        printf '   Key sudah tersimpan. Ketik key baru, atau Enter untuk pakai yang lama: '
+    else
+        printf '   Masukkan GEMINI_API_KEY (Enter untuk isi nanti): '
+    fi
+    read -r NEW_KEY </dev/tty || NEW_KEY=""
+fi
 if [ -n "$NEW_KEY" ]; then
     printf 'GEMINI_API_KEY=%s\n' "$NEW_KEY" > "$ENV_FILE"
-    echo "   ✓ Key disimpan ke $ENV_FILE"
-elif [ -n "$CURRENT_KEY" ]; then
-    echo "   ✓ Tetap pakai key lama."
+    log "   ✓ Key disimpan ke $ENV_FILE"
+elif [ -n "$CURRENT_KEY" ] && [ "${CURRENT_KEY#ISI_}" = "$CURRENT_KEY" ]; then
+    log "   ✓ Tetap pakai key lama."
 else
-    echo "GEMINI_API_KEY=ISI_GEMINI_API_KEY_DISINI" > "$ENV_FILE"
-    warn "Key belum diisi. Edit $ENV_FILE lalu: /etc/init.d/$SERVICE restart"
+    printf 'GEMINI_API_KEY=ISI_GEMINI_API_KEY_DISINI\n' > "$ENV_FILE"
+    log "   ⚠️  Belum diisi. Edit nanti: vi $ENV_FILE"
 fi
-chmod 600 "$ENV_FILE" 2>/dev/null
+chmod 600 "$ENV_FILE"
 
-# ---------- service procd (auto-start saat boot) ----------
-STEP="membuat service procd"
-cat > "/etc/init.d/$SERVICE" <<'AIVK_EOF_INIT'
+STEP="pasang service procd ($SERVICE_NAME)"
+cat > "/etc/init.d/$SERVICE_NAME" <<'KLIP_INIT_EOF'
 #!/bin/sh /etc/rc.common
-# AI Video Klip V4 — service procd
+# AI Video Klip V4 — service procd (auto-restart kalau crash)
 START=99
 STOP=10
 USE_PROCD=1
 
+APP_DIR=/mnt/sda1/ai-video-klip
+
 start_service() {
+    [ -f "$APP_DIR/app.py" ] || return 1
     procd_open_instance
-    # tunggu storage ter-mount (maks ~3 menit) baru jalankan app
-    procd_set_param command /bin/sh -c 'n=0; while [ ! -f "@INSTALL_DIR@/app.py" ] && [ "$n" -lt 90 ]; do sleep 2; n=$((n+1)); done; exec /bin/sh "@INSTALL_DIR@/start.sh"'
-    procd_set_param env AIVK_PORT=@PORT@
-    procd_set_param respawn 3600 10 0
+    procd_set_param command /usr/bin/python3 "$APP_DIR/app.py"
+    procd_set_param chdir "$APP_DIR"
+    procd_set_param env XDG_CACHE_HOME="$APP_DIR/.cache" TMPDIR="$APP_DIR/.tmp"
+    procd_set_param respawn
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_close_instance
 }
-AIVK_EOF_INIT
-sed -i -e "s|@INSTALL_DIR@|$INSTALL_DIR|g" -e "s|@PORT@|$PORT|g" "/etc/init.d/$SERVICE"
-chmod +x "/etc/init.d/$SERVICE"
+KLIP_INIT_EOF
+chmod +x "/etc/init.d/$SERVICE_NAME"
+"/etc/init.d/$SERVICE_NAME" enable
+"/etc/init.d/$SERVICE_NAME" restart
 
-STEP="menjalankan service"
-"/etc/init.d/$SERVICE" enable
-"/etc/init.d/$SERVICE" restart
-sleep 6
+LAN_IP="$(uci -q get network.lan.ipaddr 2>/dev/null || true)"
+LAN_IP="${LAN_IP%%/*}"
 
-LAN_IP="$(uci -q get network.lan.ipaddr 2>/dev/null | cut -d/ -f1)"
-[ -z "$LAN_IP" ] && LAN_IP="$(ip -4 addr show br-lan 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2); print $2; exit}')"
-[ -z "$LAN_IP" ] && LAN_IP="IP-ROUTER"
-
-UP=0
-for i in 1 2 3 4 5; do
-    if wget -q -O /dev/null "http://127.0.0.1:$PORT/" 2>/dev/null; then UP=1; break; fi
-    sleep 3
-done
-
-echo ""
-echo "========================================"
-if [ "$UP" = "1" ]; then
-    echo "✅ INSTALASI SELESAI — aplikasi sudah jalan."
-else
-    echo "⚠️  Terpasang, tapi web belum merespons. Cek log: logread | tail -n 40"
-fi
-echo "========================================"
-echo "Buka di browser : http://$LAN_IP:$PORT"
-echo "Folder data     : $INSTALL_DIR"
-echo "  ├─ downloads/      (video asli dari YouTube)"
-echo "  ├─ clips/          (hasil klip)"
-echo "  ├─ uploads_srt/    (subtitle)"
-echo "  └─ uploads_music/  (musik latar)"
-echo ""
-echo "Perintah berguna:"
-echo "  /etc/init.d/$SERVICE restart|stop|start"
-echo "  logread -e python3 | tail     (lihat log)"
-echo "  sh $INSTALL_DIR/update-ytdlp.sh   (update yt-dlp kalau YouTube berubah)"
-echo "  sh install.sh uninstall           (hapus service)"
+log ""
+log "======================================="
+log "✅ INSTALASI SELESAI"
+log "======================================="
+log "Buka dari HP/laptop di LAN : http://${LAN_IP:-<IP-router>}:$APP_PORT"
+log "Video, klip, subtitle, musik: $PROJECT_DIR"
+log "Kontrol service           : /etc/init.d/$SERVICE_NAME {start|stop|restart|status}"
+log "Log                        : logread -e python3  (atau: logread -f)"
+log ""
+log "Catatan:"
+log "- Sisi lain: kalau USB belum ter-mount saat boot, service akan gagal start."
+log "  Pastikan mount point auto-mount di LuCI."
+log "- Ganti/isi API key: vi $ENV_FILE  lalu  /etc/init.d/$SERVICE_NAME restart"
